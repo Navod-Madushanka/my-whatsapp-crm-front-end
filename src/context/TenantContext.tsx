@@ -1,22 +1,14 @@
 // src/context/TenantContext.tsx
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useAuth } from './AuthContext';
 import axios from 'axios';
-
-interface TenantState {
-  businessId: string | null;
-  businessName: string | null;
-  isMetaConnected: boolean; // Tracks if WABA ID & Access Token exist
-  phoneNumberId: string | null;
-  wabaId: string | null;
-  loading: boolean;
-}
-
-const TenantContext = createContext<TenantState | undefined>(undefined);
+import type { TenantState } from './TenantTypes';
+import { TenantContext } from './useTenant';
 
 export const TenantProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { token, isAuthenticated } = useAuth();
-  const [tenant, setTenant] = useState<TenantState>({
+  
+  const [tenant, setTenant] = useState<Omit<TenantState, 'refreshTenant'>>({
     businessId: null,
     businessName: null,
     isMetaConnected: false,
@@ -25,49 +17,73 @@ export const TenantProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     loading: true,
   });
 
+  const isMounted = useRef(true);
+  
+  // Track if we have already performed the initial fetch to avoid loops
+  const hasFetched = useRef(false);
+
   useEffect(() => {
-    const fetchBusinessProfile = async () => {
-      if (!isAuthenticated || !token) {
-        setTenant(prev => ({ ...prev, loading: false }));
-        return;
+    isMounted.current = true;
+    return () => { isMounted.current = false; };
+  }, []);
+
+  const refreshTenant = useCallback(async () => {
+    // Return early if not authenticated
+    if (!isAuthenticated || !token) {
+      if (isMounted.current) {
+        setTenant(prev => (prev.loading ? { ...prev, loading: false } : prev));
       }
+      return;
+    }
 
-      try {
-        // This calls a 'System Health' or 'Profile' endpoint [cite: 158]
-        const response = await axios.get(`${import.meta.env.VITE_API_URL}/auth/me`, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
+    try {
+      // Calls the profile endpoint
+      const response = await axios.get(`${import.meta.env.VITE_API_URL}/auth/me`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
 
-        const data = response.data; // Expected: { id, name, waba_id, phone_number_id, meta_access_token }
-        
+      const data = response.data;
+      
+      if (isMounted.current) {
         setTenant({
           businessId: data.id,
           businessName: data.name,
-          isMetaConnected: !!data.waba_id && !!data.meta_access_token,
+          // Checks presence of WABA ID and Access Token
+          isMetaConnected: !!(data.waba_id && data.meta_access_token),
           phoneNumberId: data.phone_number_id,
           wabaId: data.waba_id,
           loading: false,
         });
-      } catch (error) {
-        console.error("Failed to fetch tenant context", error);
+      }
+    } catch (error) {
+      console.error("Failed to refresh tenant data", error);
+      if (isMounted.current) {
         setTenant(prev => ({ ...prev, loading: false }));
       }
-    };
-
-    fetchBusinessProfile();
+    }
   }, [isAuthenticated, token]);
 
+  // Use a timeout or a microtask to move the execution out of the synchronous effect body
+  useEffect(() => {
+    if (!hasFetched.current && isAuthenticated && token) {
+      const controller = new AbortController();
+      
+      // Defers execution to the next tick to avoid the "cascading render" warning
+      const timeoutId = setTimeout(() => {
+        refreshTenant();
+        hasFetched.current = true;
+      }, 0);
+
+      return () => {
+        clearTimeout(timeoutId);
+        controller.abort();
+      };
+    }
+  }, [refreshTenant, isAuthenticated, token]);
+
   return (
-    <TenantContext.Provider value={tenant}>
+    <TenantContext.Provider value={{ ...tenant, refreshTenant }}>
       {children}
     </TenantContext.Provider>
   );
-};
-
-export const useTenant = () => {
-  const context = useContext(TenantContext);
-  if (context === undefined) {
-    throw new Error('useTenant must be used within a TenantProvider');
-  }
-  return context;
 };
